@@ -11,6 +11,40 @@ pub struct WaveData {
     pub sample_rate: u32,
 }
 
+pub struct ChunkFeatures {
+    pub rms: f32,
+    // later:
+    // pub centroid: f32,
+    // pub spectrum: Vec<f32>,
+}
+
+pub struct FeatureSet {
+    pub chunk_seconds: usize,
+    pub features: Vec<ChunkFeatures>,
+}
+
+pub fn extract_rms_features(samples: &[f32], sample_rate: u32, chunk_seconds: usize) -> FeatureSet {
+    let samples_per_chunk = chunk_seconds * sample_rate as usize;
+    let total_chunks = samples.len() / samples_per_chunk;
+
+    let mut features = Vec::with_capacity(total_chunks);
+
+    for chunk_idx in 0..total_chunks {
+        let start = chunk_idx * samples_per_chunk;
+        let end = start + samples_per_chunk;
+
+        let chunk = &samples[start..end];
+        let rms = compute_rms_stereo(chunk, 1);
+
+        features.push(ChunkFeatures { rms });
+    }
+
+    FeatureSet {
+        chunk_seconds,
+        features,
+    }
+}
+
 pub fn compute_rms_stereo(samples: &[f32], channels: usize) -> f32 {
     if samples.is_empty() || channels == 0 {
         return 0.0;
@@ -137,14 +171,6 @@ pub fn read_wav(path: &str) -> WaveData {
     //Compute RMS for mono_samples
 
     let frames_per_chunk = 15 * sample_rate as usize;
-
-    for i in 0..5 {
-        let start = (i + 2) * frames_per_chunk; // skip silence
-        let end = start + frames_per_chunk;
-
-        let rms = compute_rms_stereo(&samples[start..end], 1);
-        println!("Chunk {} RMS = {}", i + 2, rms);
-    }
 
     WaveData {
         samples: mono_samples,
