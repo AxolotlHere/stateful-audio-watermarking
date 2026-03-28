@@ -2,7 +2,9 @@ use hound;
 use plotters::prelude::*;
 use std::fs;
 use std::path::Path;
-
+const MIN_CHUNK_SECS: usize = 5;
+const MAX_CHUNK_SECS: usize = 15;
+const FADE_MS: f32 = 8.0;
 const CHUNK_SECONDS: usize = 15;
 const DOWNSAMPLE: usize = 256;
 
@@ -11,6 +13,7 @@ pub struct WaveData {
     pub sample_rate: u32,
 }
 
+#[allow(dead_code)]
 pub struct ChunkFeatures {
     pub rms: f32,
     // later:
@@ -18,6 +21,7 @@ pub struct ChunkFeatures {
     // pub spectrum: Vec<f32>,
 }
 
+#[allow(dead_code)]
 pub struct FeatureSet {
     pub chunk_seconds: usize,
     pub features: Vec<ChunkFeatures>,
@@ -170,7 +174,7 @@ pub fn read_wav(path: &str) -> WaveData {
     };
     //Compute RMS for mono_samples
 
-    let frames_per_chunk = 15 * sample_rate as usize;
+    let _frames_per_chunk = 15 * sample_rate as usize;
 
     WaveData {
         samples: mono_samples,
@@ -206,4 +210,23 @@ pub fn plot_waveform(wave: &WaveData, out: &str, max_samples: usize, start: usiz
         .unwrap();
 
     root.present().unwrap();
+}
+
+pub fn write_wav(wave: &WaveData, path: &str) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: wave.sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .unwrap_or_else(|e| panic!("Failed to create WAV '{}': {}", path, e));
+ 
+    for &s in &wave.samples {
+        // Clamp to [-1, 1] then convert to i16
+        let clamped = s.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32) as i16;
+        writer.write_sample(pcm).expect("Failed to write sample");
+    }
+    writer.finalize().expect("Failed to finalize WAV writer");
 }
