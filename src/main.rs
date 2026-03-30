@@ -19,6 +19,7 @@ fn main() {
         "verify"      => run_verify(key, true),
         "verify-blind"=> run_verify(key, false),
         "robustness"  => run_robustness(key),
+        "security"    => run_security_test(key),
         _             => run_embed(key),
     }
 }
@@ -128,4 +129,21 @@ fn run_robustness(key: u64) {
 
     print_robustness_report(&results, baseline_conf);
     print_layer_survival(&results);
+}
+
+// ─── appended: security test mode ────────────────────────────────────────────
+
+fn run_security_test(key: u64) {
+    println!("═══ SECURITY TEST — WRONG KEY ANALYSIS ══════════════════");
+    use audio::extractor::run_key_test;
+
+    let wave = audio::io::read_wav("output_watermarked.wav");
+    let fp = match audio::extractor::Fingerprint::load("original.wmpf") {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Cannot load fingerprint: {e}"); return; }
+    };
+
+    println!(" Testing 100 wrong keys (this takes ~30s)...\n");
+    let result = run_key_test(&wave.samples, wave.sample_rate, key, &fp, 100);
+    result.print_report();
 }
