@@ -21,18 +21,41 @@
 use std::f32::consts::PI;
 use super::fingerprint::ChunkFingerprint;
 
+/// Expected residual correlation for the correct key, per layer.
+/// Measured empirically: correct key produces these corr values due to
+/// other layers' deltas polluting (wm - sim_before).
+/// Calibration divides raw corr by expected, normalising correct key → 1.0.
+/// Wrong key corr ≈ 0 (orthogonal) → score ≈ 0 regardless of expected.
+const EXPECTED_CORR: [f32; 15] = [
+    0.244,  // L1  AmplitudeScaling
+    0.883,  // L2  MicroTimeShift
+    0.160,  // L3  EnvelopeShaping
+    0.222,  // L4  BandLimitedGain
+    0.050,  // L5  HFEmphasis (genuinely weak — low weight in confidence)
+    0.582,  // L6  NarrowbandAtten
+    0.909,  // L7  PhasePerturbation
+    0.075,  // L8  SampleReordering
+    0.852,  // L9  EnergyRedistrib
+    0.202,  // L10 NoiseShaping
+    0.999,  // L11 ControlledNonlinear
+    0.218,  // L12 LogisticMap
+    0.053,  // L13 CombFilter
+    0.499,  // L14 SpectralTilt
+    0.050,  // L15 TemporalVariance (floored — low weight in confidence)
+];
+
 pub fn measure_layer_ref(
     wm_chunk:    &[f32],
     _orig:       &ChunkFingerprint,
     sim_before:  &[f32],
-    sim_after:   &[f32],   // audio state right after this layer ran (used by L10/L12)
+    sim_after:   &[f32],
     sample_rate: u32,
     layer_idx:   usize,
     key_byte:    u8,
     key_u64:     u64,
 ) -> f32 {
     let sr = sample_rate as f32;
-    match layer_idx {
+    let raw = match layer_idx {
         0  => score_amplitude_scaling(wm_chunk, sim_before, key_byte),
         1  => score_micro_time_shift(wm_chunk, sim_before, key_byte),
         2  => score_envelope_shaping(wm_chunk, sim_before, sr, key_byte),
@@ -48,8 +71,13 @@ pub fn measure_layer_ref(
         12 => score_comb_filter(wm_chunk, sim_before, sr, key_byte),
         13 => score_spectral_tilt(wm_chunk, sim_before, sr, key_byte),
         14 => score_temporal_variance(wm_chunk, sim_before, key_byte),
-        _  => 0.0,
-    }
+        _  => return 0.0,
+    };
+    // Calibrate: divide raw corr by expected correct-key corr.
+    // Correct key → raw ≈ EXPECTED_CORR[idx] → calibrated ≈ 1.0
+    // Wrong key   → raw ≈ 0                  → calibrated ≈ 0.0
+    let expected = EXPECTED_CORR[layer_idx];
+    (raw / expected).clamp(0.0, 1.0)
 }
 
 // ─── helpers: residual-based correlation ─────────────────────────────────────
@@ -74,15 +102,15 @@ fn residual_corr(wm: &[f32], sb: &[f32], predicted: &[f32]) -> f32 {
     }
 
     if na_sq < 1e-30 || nb_sq < 1e-30 {
-        // Both residuals are essentially zero (layer had no effect at this slot).
-        // Score 0.5 — we can neither confirm nor deny.
-        return 0.5;
+        // Near-zero residual — layer had negligible effect here.
+        // Return 0.0 so this does NOT inflate wrong-key scores.
+        return 0.0;
     }
 
     let corr = (dot / (na_sq.sqrt() * nb_sq.sqrt())).clamp(-1.0, 1.0) as f32;
-    // Map [-1, 1] → [0, 1]
-    (corr + 1.0) * 0.5
+    corr.max(0.0)
 }
+
 
 // ─── L1: Amplitude Scaling ────────────────────────────────────────────────────
 fn score_amplitude_scaling(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
@@ -202,17 +230,13 @@ fn score_noise_shaping(wm: &[f32], sb: &[f32], sa: &[f32], key_u64: u64) -> f32 
     let seq_nrg: f64 = seq.iter().map(|s| *s as f64 * *s as f64).sum();
     let res_nrg: f64 = residual.iter().map(|r| *r as f64 * *r as f64).sum();
 
-    if seq_nrg < 1e-30 || res_nrg < 1e-30 { return 0.0; }
+    if seq_nrg < 1e-30 { return 0.0; }
 
-    // Normalised correlation: how much of the residual's variance is explained by the sequence?
-    // For correct key: dot² / (seq_nrg * res_nrg) → fraction of residual that is this sequence
-    // Scale up because the sequence is buried in other-layer noise (SNR ~1/400)
-    // Use coherence: dot / sqrt(seq_nrg * res_nrg), then scale by sqrt(n) for accumulation gain
-    let coherence = (dot / (seq_nrg.sqrt() * res_nrg.sqrt())) as f32;
-    // sqrt(n) ≈ 693 for n=480000; coherence for correct key ≈ amplitude/total_residual_rms
-    // Boost by sqrt(n) to make it a proper matched-filter score
-    let matched = coherence * (n as f32).sqrt();
-    matched.clamp(0.0, 1.0)
+    // Classic matched filter: dot / seq_nrg
+    // Correct key:  residual contains the sequence → dot/seq_nrg ≈ 1.0
+    // Wrong key:    residual is uncorrelated with sequence → dot/seq_nrg ≈ N(0, sigma)
+    //               sigma = rms(residual)/rms(seq)/sqrt(n) ≈ 0.16 → clamps to ~0
+    ((dot / seq_nrg) as f32).clamp(0.0, 1.0)
 }
 
 // ─── L11: Controlled Nonlinear (tanh) ────────────────────────────────────────
@@ -246,11 +270,9 @@ fn score_logistic_map(wm: &[f32], sb: &[f32], sa: &[f32], key_byte: u8) -> f32 {
     let seq_nrg: f64 = seq.iter().map(|s| *s as f64 * *s as f64).sum();
     let res_nrg: f64 = residual.iter().map(|r| *r as f64 * *r as f64).sum();
 
-    if seq_nrg < 1e-30 || res_nrg < 1e-30 { return 0.0; }
+    if seq_nrg < 1e-30 { return 0.0; }
 
-    let coherence = (dot / (seq_nrg.sqrt() * res_nrg.sqrt())) as f32;
-    let matched   = coherence * (n as f32).sqrt();
-    matched.clamp(0.0, 1.0)
+    ((dot / seq_nrg) as f32).clamp(0.0, 1.0)
 }
 
 // ─── L13: Comb Filter ─────────────────────────────────────────────────────────

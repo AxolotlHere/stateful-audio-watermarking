@@ -53,34 +53,25 @@ pub fn extract_with_ref(
         let chunk_idx = chunk_count;
         chunk_count += 1;
 
-        // Replay the chain: reconstruct the exact audio state at each
-        // layer position using the candidate key and chunk index.
-        // Each layer's measurement uses the chain-derived key_byte,
-        // so a wrong key produces wrong expected values → low scores.
+        // Replay the chain sequentially.
+        // sim_before at each slot = audio after all prior layers with this key.
+        // Correct key → sim_before matches real pre-layer audio → high residual corr.
+        // Wrong key   → sim_before diverges at slot 0 → residuals uncorrelated.
         let mut state = ChainState::new(key, chunk_idx);
-
-        // We also simulate what the audio WOULD look like after each
-        // layer if the key is correct — by applying layers to a copy.
-        // This lets us compute the inter-layer audio hash for the chain.
         let mut sim_chunk: Vec<f32> = orig.orig_samples.clone();
 
         for (slot, &layer_idx) in order.iter().enumerate() {
             let key_byte = state.derive_byte(slot);
             let key_u64  = state.derive_u64(slot);
 
-            // sim_before: audio state right before this layer ran.
-            // Used by all transform/filter layers whose residual = predicted - sim_before.
             let sim_before = sim_chunk.clone();
-
-            // Apply layer to advance sim_chunk
             apply_single_layer(&mut sim_chunk, sample_rate, layer_idx, key_byte, key_u64);
 
-            // Score: does this layer's effect on sim_before match wm_chunk?
             let score = measure_layer_ref(
                 wm_chunk,
                 orig,
                 &sim_before,
-                &sim_chunk,   // sim_after: state right after this layer — used by L10/L12
+                &sim_chunk,
                 sample_rate,
                 layer_idx,
                 key_byte,
@@ -88,7 +79,6 @@ pub fn extract_with_ref(
             );
             layer_accum[layer_idx].push(score);
 
-            // Advance chain state using audio AFTER this layer
             state = state.advance(&sim_chunk, sample_rate);
         }
     }

@@ -25,7 +25,7 @@ fn main() {
 fn run_embed(key: u64) {
     println!("═══ EMBED MODE ═══════════════════════════════════════════");
 
-    let mut wave = read_wav("input_sample/Faint.wav");
+    let mut wave = read_wav("input_sample/Faint-1.wav");
     println!("Loaded {} samples @ {} Hz", wave.samples.len(), wave.sample_rate);
 
     let order   = permute_layers(key);
