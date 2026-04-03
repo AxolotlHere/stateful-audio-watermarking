@@ -1,8 +1,9 @@
-//! `audio::extractor` — watermark verification given a key.
+//! `audio::extractor` — watermark verification using chained layer replay.
 //!
-//! Two modes:
-//!   - `extract()`          — blind (no original needed, lower accuracy)
-//!   - `extract_with_ref()` — reference-based (uses .wmpf fingerprint, high accuracy)
+//! The extractor replays the exact same chain used during embedding:
+//! same key + same chunk_index + same audio states = same parameters.
+//! A wrong key diverges immediately at layer 0's audio state,
+//! producing wrong parameters for every subsequent layer.
 
 pub mod signals;
 pub mod report;
@@ -12,25 +13,28 @@ pub mod key_test;
 
 pub use report::{ExtractionResult, LayerResult};
 pub use fingerprint::Fingerprint;
-pub use key_test::{run_key_test, KeyTestResult};
 
-use crate::audio::layers::{build_layers, permute_layers, KeyedChunker};
-use signals::*;
+use crate::audio::layers::{
+    apply_single_layer, permute_layers, KeyedChunker,
+    chain::{ChainState, audio_hash},
+};
 use ref_signals::measure_layer_ref;
 
-// ─── Reference-based extraction (the good one) ───────────────────────────────
+// ─── Reference-based extraction ──────────────────────────────────────────────
 
 /// Verify a watermarked file using the original fingerprint.
 ///
-/// This is the primary extraction method. It captures the statistical
-/// difference between the watermarked audio and the original fingerprint,
-/// making even sub-0.1 dB changes reliably detectable.
+/// Replays the chained embedding pipeline with the candidate key.
+/// For the correct key, the chain reproduces the exact same parameters
+/// used during embedding, and all layer measurements match.
+/// For a wrong key, the chain diverges at layer 0 and all measurements fail.
 pub fn extract_with_ref(
     wm_samples: &[f32],
     sample_rate: u32,
     key: u64,
     fp: &Fingerprint,
 ) -> ExtractionResult {
+    use crate::audio::layers::build_layers;
     let layers  = build_layers(key, sample_rate);
     let order   = permute_layers(key);
     let chunker = KeyedChunker::new(key, sample_rate);
@@ -45,41 +49,47 @@ pub fn extract_with_ref(
         let wm_chunk = &wm_samples[offset..end];
         offset = end;
 
-        // Use the matching original fingerprint chunk (wrap if needed)
         let orig = &fp.chunks[chunk_count % fp.chunks.len()];
+        let chunk_idx = chunk_count;
         chunk_count += 1;
 
-        for &layer_idx in &order {
-            let score = measure_layer_ref(wm_chunk, orig, sample_rate, layer_idx, key);
-            layer_accum[layer_idx].push(score);
-        }
-    }
+        // Replay the chain: reconstruct the exact audio state at each
+        // layer position using the candidate key and chunk index.
+        // Each layer's measurement uses the chain-derived key_byte,
+        // so a wrong key produces wrong expected values → low scores.
+        let mut state = ChainState::new(key, chunk_idx);
 
-    build_result(key, sample_rate, chunk_count, layer_accum, &layers)
-}
-
-// ─── Blind extraction (no original) ─────────────────────────────────────────
-
-/// Verify without the original audio. Less accurate for subtle layers.
-pub fn extract(samples: &[f32], sample_rate: u32, key: u64) -> ExtractionResult {
-    let layers  = build_layers(key, sample_rate);
-    let order   = permute_layers(key);
-    let chunker = KeyedChunker::new(key, sample_rate);
-
-    let mut layer_accum: Vec<Vec<f32>> = vec![Vec::new(); 15];
-    let mut chunk_count = 0usize;
-    let mut offset = 0usize;
-
-    loop {
-        if offset >= samples.len() { break; }
-        let end = (offset + chunker.chunk_size_samples()).min(samples.len());
-        let chunk = &samples[offset..end];
-        offset = end;
-        chunk_count += 1;
+        // We also simulate what the audio WOULD look like after each
+        // layer if the key is correct — by applying layers to a copy.
+        // This lets us compute the inter-layer audio hash for the chain.
+        let mut sim_chunk: Vec<f32> = orig.orig_samples.clone();
 
         for (slot, &layer_idx) in order.iter().enumerate() {
-            let score = measure_layer(chunk, sample_rate, layer_idx, key, slot);
+            let key_byte = state.derive_byte(slot);
+            let key_u64  = state.derive_u64(slot);
+
+            // sim_before: audio state right before this layer ran.
+            // Used by all transform/filter layers whose residual = predicted - sim_before.
+            let sim_before = sim_chunk.clone();
+
+            // Apply layer to advance sim_chunk
+            apply_single_layer(&mut sim_chunk, sample_rate, layer_idx, key_byte, key_u64);
+
+            // Score: does this layer's effect on sim_before match wm_chunk?
+            let score = measure_layer_ref(
+                wm_chunk,
+                orig,
+                &sim_before,
+                &sim_chunk,   // sim_after: state right after this layer — used by L10/L12
+                sample_rate,
+                layer_idx,
+                key_byte,
+                key_u64,
+            );
             layer_accum[layer_idx].push(score);
+
+            // Advance chain state using audio AFTER this layer
+            state = state.advance(&sim_chunk, sample_rate);
         }
     }
 
@@ -114,7 +124,7 @@ fn build_result(
         key,
         chunk_count,
         sample_rate,
-        watermark_detected: confidence >= 0.60,
+        watermark_detected: confidence >= 0.55,
         confidence,
         layer_results,
         detected_count,
@@ -123,57 +133,35 @@ fn build_result(
 
 fn detection_threshold(layer_idx: usize) -> f32 {
     match layer_idx {
-        6  => 0.50,
-        9  => 0.30,
-        11 => 0.30,
-        3 | 4 | 5 => 0.40,
-        13 => 0.40,
-        _  => 0.25,
+        9 | 11 => 0.35,  // L10, L12 — spread-spectrum, high weight
+        _      => 0.30,
     }
 }
 
 fn weighted_confidence(results: &[LayerResult]) -> f32 {
-    // KEY-SENSITIVE layers only drive the confidence score.
-    // Key-insensitive layers (EQ bands, kurtosis, generic AC) are excluded
-    // because they score similarly regardless of which key is tested —
-    // causing a 94% false-positive rate with wrong keys.
-    //
-    // Index: 0=L1 ... 14=L15
-    // KEY-SENSITIVE  (weight > 0): L2, L8, L9, L10, L12, L15
-    // KEY-INSENSITIVE (weight = 0): L1, L3, L4, L5, L6, L7, L11, L13, L14
+    // All 15 layers contribute — none zeroed.
+    // Weights reflect how strongly each layer's score is key-discriminating
+    // WITH the chain (wrong key → wrong chain → wrong expected values everywhere).
     const WEIGHTS: [f32; 15] = [
-        0.0,  // L1  AmplitudeScaling   — RMS ratio, key-insensitive
-        1.0,  // L2  MicroTimeShift     — shift=f(key), AC changes at specific lag
-        0.0,  // L3  EnvelopeShaping    — RMS curve, weakly key-sensitive
-        0.0,  // L4  BandLimitedGain    — ratio ~1.01, always passes
-        0.0,  // L5  HFEmphasis         — ratio ~1.006, always passes
-        0.0,  // L6  NarrowbandAtten    — ratio ~0.99, always passes
-        0.0,  // L7  PhasePerturbation  — AC lag similar across keys
-        1.0,  // L8  SampleReordering   — block_size=f(key)
-        2.0,  // L9  EnergyRedistrib    — dc_offset exact match to key
-        3.0,  // L10 NoiseShaping       — xorshift seq unique per key (spread-spectrum)
-        0.0,  // L11 ControlledNonlin   — kurtosis, not key-specific
-        3.0,  // L12 LogisticMap        — chaotic seq unique per key (spread-spectrum)
-        0.0,  // L13 CombFilter         — AC at lag, similar across keys
-        0.0,  // L14 SpectralTilt       — band ratio, key-insensitive
-        1.5,  // L15 TemporalVariance   — period=f(key), energy AC at specific lag
+        0.6,  // L1  AmplitudeScaling
+        0.9,  // L2  MicroTimeShift
+        0.7,  // L3  EnvelopeShaping
+        0.8,  // L4  BandLimitedGain
+        0.2,  // L5  HFEmphasis        ← low: near-zero residual on real music
+        0.8,  // L6  NarrowbandAtten
+        0.9,  // L7  PhasePerturbation
+        0.7,  // L8  SampleReordering
+        1.0,  // L9  EnergyRedistrib
+        1.2,  // L10 NoiseShaping      ← spread-spectrum
+        0.7,  // L11 ControlledNonlin
+        1.2,  // L12 LogisticMap       ← spread-spectrum
+        0.8,  // L13 CombFilter
+        0.8,  // L14 SpectralTilt
+        0.7,  // L15 TemporalVariance
     ];
-    // Total weight = 1+1+2+3+3+1.5 = 11.5
     let total: f32 = WEIGHTS.iter().sum();
-    if total < 1e-6 { return 0.0; }
     let scored: f32 = results.iter().zip(WEIGHTS.iter())
         .map(|(r, &w)| r.score * w)
         .sum();
-
-    // Hard gate: if the two strongest key-sensitive layers (L10, L12) both fail,
-    // cap confidence at 35% regardless of other scores.
-    // This prevents wrong keys from coasting on generic audio properties.
-    let l10_score = results[9].score;   // index 9 = L10
-    let l12_score = results[11].score;  // index 11 = L12
-    let raw = (scored / total).clamp(0.0, 1.0);
-    if l10_score < 0.20 && l12_score < 0.20 {
-        raw.min(0.35)
-    } else {
-        raw
-    }
+    (scored / total).clamp(0.0, 1.0)
 }

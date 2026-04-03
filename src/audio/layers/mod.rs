@@ -1,34 +1,35 @@
-//! `audio::layers` — 15 heterogeneous watermark transformation layers.
+//! `audio::layers` — 15 heterogeneous watermark transformation layers
+//! with chained parameter derivation.
 //!
-//! # Module layout
+//! # How the chain works
 //!
-//! ```
-//! layers/
-//!   layer_trait.rs   – the `Layer` trait
-//!   layer1.rs  ..  layer15.rs  – individual implementations
-//!   permutation.rs  – key-driven layer-order permutation engine
-//!   chunker.rs      – key-derived chunk splitter
-//!   mod.rs          – this file; public API surface
-//! ```
+//! Each layer's key_byte is derived from:
+//!   - The master key K
+//!   - The chunk index (unique per chunk)
+//!   - The audio state AFTER the previous layer ran (RMS + spectral centroid)
 //!
-//! # Typical usage
+//! This means every layer's parameters depend on every previous layer's
+//! effect on the audio. A wrong key produces wrong parameters at layer 0,
+//! which produce wrong audio state, which cascades into increasingly wrong
+//! parameters for all subsequent layers.
+//!
+//! # Usage
 //!
 //! ```rust
-//! use audio::layers::{build_layers, permute_layers, KeyedChunker};
+//! use audio::layers::{permute_layers, KeyedChunker, apply_chained_layers};
 //!
 //! let key: u64 = 0xDEAD_BEEF_1234_5678;
-//! let layers = build_layers(key, sample_rate);
-//! let order  = permute_layers(key);          // [0..15] shuffled
+//! let order   = permute_layers(key);
 //! let chunker = KeyedChunker::new(key, sample_rate);
 //!
-//! for chunk in chunker.chunks_mut(&mut samples) {
-//!     for &idx in &order {
-//!         layers[idx].apply(chunk, sample_rate);
-//!     }
+//! for (chunk_idx, chunk) in chunker.iter_chunks_mut(&mut samples).enumerate() {
+//!     apply_chained_layers(chunk, sample_rate, key, &order, chunk_idx);
+//!     chunker.apply_boundary_fade(chunk);
 //! }
 //! ```
 
 pub mod layer_trait;
+pub mod chain;
 
 pub mod layer1;
 pub mod layer2;
@@ -52,6 +53,7 @@ pub mod chunker;
 pub use layer_trait::Layer;
 pub use permutation::permute_layers;
 pub use chunker::KeyedChunker;
+pub use chain::{ChainState, audio_hash};
 
 use layer1::AmplitudeScalingLayer;
 use layer2::MicroTimeShiftLayer;
@@ -69,12 +71,70 @@ use layer13::CombFilterLayer;
 use layer14::SpectralTiltLayer;
 use layer15::TemporalVarianceLayer;
 
-/// Construct all 15 layers using sub-keys derived from `key`.
+// ─── Chained pipeline ────────────────────────────────────────────────────────
+
+/// Apply all 15 layers to `chunk` in the permuted order, with each layer's
+/// parameters derived from the chain state that evolves after every layer.
 ///
-/// Each layer receives a different byte or u64 slice of the key so that
-/// their parameters are independent and spread across the key space.
+/// This is the primary embedding function. The chain ensures every layer's
+/// parameters depend on all previous layers' audio output — a wrong key
+/// cascades into total parameter divergence.
+pub fn apply_chained_layers(
+    samples: &mut [f32],
+    sample_rate: u32,
+    key: u64,
+    order: &[usize; 15],
+    chunk_index: usize,
+) {
+    let mut state = ChainState::new(key, chunk_index);
+
+    for (slot, &layer_idx) in order.iter().enumerate() {
+        // Derive this layer's key_byte from the current chain state
+        let key_byte = state.derive_byte(slot);
+        let key_u64  = state.derive_u64(slot);
+
+        // Build and apply the layer with chained parameters
+        apply_single_layer(samples, sample_rate, layer_idx, key_byte, key_u64);
+
+        // Advance chain using audio state AFTER this layer ran
+        state = state.advance(samples, sample_rate);
+    }
+}
+
+/// Apply a single layer by index using the given key_byte/key_u64.
+/// Used by both the embedder and extractor.
+pub fn apply_single_layer(
+    samples: &mut [f32],
+    sample_rate: u32,
+    layer_idx: usize,
+    key_byte: u8,
+    key_u64: u64,
+) {
+    match layer_idx {
+        0  => AmplitudeScalingLayer::new(key_byte).apply(samples, sample_rate),
+        1  => MicroTimeShiftLayer::new(key_byte).apply(samples, sample_rate),
+        2  => EnvelopeShapingLayer::new(key_byte).apply(samples, sample_rate),
+        3  => BandLimitedGainLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        4  => HighFrequencyEmphasisLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        5  => NarrowbandAttenuationLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        6  => PhasePerturbationLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        7  => LocalSampleReorderingLayer::new(key_byte).apply(samples, sample_rate),
+        8  => EnergyRedistributionLayer::new(key_byte).apply(samples, sample_rate),
+        9  => NoiseShapingLayer::new(key_u64).apply(samples, sample_rate),
+        10 => ControlledNonlinearLayer::new(key_byte).apply(samples, sample_rate),
+        11 => LogisticMapLayer::new(key_byte).apply(samples, sample_rate),
+        12 => CombFilterLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        13 => SpectralTiltLayer::new(key_byte, sample_rate).apply(samples, sample_rate),
+        14 => TemporalVarianceLayer::new(key_byte).apply(samples, sample_rate),
+        _  => {}
+    }
+}
+
+// ─── Legacy API (kept for extractor compatibility) ───────────────────────────
+
+/// Build all 15 layers with parameters derived directly from key (no chain).
+/// Used only by the old blind extractor. Prefer `apply_chained_layers`.
 pub fn build_layers(key: u64, sample_rate: u32) -> Vec<Box<dyn Layer>> {
-    // Derive 15 independent bytes/u64 values from the master key.
     let bytes: Vec<u8> = (0u64..15)
         .map(|i| derive_byte(key, i))
         .collect();
@@ -98,25 +158,12 @@ pub fn build_layers(key: u64, sample_rate: u32) -> Vec<Box<dyn Layer>> {
     ]
 }
 
-/// Derive a pseudo-random byte from `key` at position `i`.
+// ─── Key derivation helpers ──────────────────────────────────────────────────
+
 fn derive_byte(key: u64, i: u64) -> u8 {
-    let mut h = key ^ (i.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    // One round of xorshift-mix
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^= h >> 31;
-    (h & 0xFF) as u8
+    (chain::splitmix64(key ^ i.wrapping_mul(0x9e37_79b9_7f4a_7c15)) & 0xFF) as u8
 }
 
-/// Derive a full u64 from `key` at position `i`.
 fn derive_u64(key: u64, i: u64) -> u64 {
-    let mut h = key ^ (i.wrapping_mul(0x517c_c1b7_2722_0a95));
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^= h >> 31;
-    h
+    chain::splitmix64(key ^ i.wrapping_mul(0x517c_c1b7_2722_0a95))
 }

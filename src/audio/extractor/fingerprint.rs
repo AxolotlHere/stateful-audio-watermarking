@@ -42,6 +42,11 @@ pub struct ChunkFingerprint {
     pub ac_lags: [f32; N_AC_LAGS],
     /// Normalised energy autocorrelation at lags 1..=N_ENERGY_LAGS.
     pub energy_ac: [f32; N_ENERGY_LAGS],
+    /// Full original PCM samples — used for chain simulation during extraction.
+    /// The extractor simulates layers on THIS (not the watermarked audio) so
+    /// that the chain state produced by the correct key is deterministic and
+    /// wrong keys diverge immediately at layer 0.
+    pub orig_samples: Vec<f32>,
 }
 
 /// Full fingerprint file — one [`ChunkFingerprint`] per audio chunk.
@@ -88,6 +93,8 @@ impl Fingerprint {
             for &v in &c.band_rms  { w.write_all(&v.to_le_bytes())?; }
             for &v in &c.ac_lags   { w.write_all(&v.to_le_bytes())?; }
             for &v in &c.energy_ac { w.write_all(&v.to_le_bytes())?; }
+            w.write_all(&(c.orig_samples.len() as u32).to_le_bytes())?;
+            for &v in &c.orig_samples { w.write_all(&v.to_le_bytes())?; }
         }
         w.flush()?;
         Ok(())
@@ -120,7 +127,10 @@ impl Fingerprint {
             for v in &mut band_rms  { *v = read_f32(&mut r)?; }
             for v in &mut ac_lags   { *v = read_f32(&mut r)?; }
             for v in &mut energy_ac { *v = read_f32(&mut r)?; }
-            chunks.push(ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac });
+            let n_orig = read_u32(&mut r)? as usize;
+            let mut orig_samples = vec![0f32; n_orig];
+            for v in &mut orig_samples { *v = read_f32(&mut r)?; }
+            chunks.push(ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac, orig_samples });
         }
 
         Ok(Self { key, sample_rate, chunk_samples, chunks })
@@ -154,7 +164,7 @@ fn compute_chunk_fp(chunk: &[f32], sr: f32, band_edges: &[f32]) -> ChunkFingerpr
         *v = if eac0 > 1e-12 { autocorr_raw(&energy, i + 1) / eac0 } else { 0.0 };
     }
 
-    ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac }
+    ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac, orig_samples: chunk.to_vec() }
 }
 
 /// 8 log-spaced band edges from 20 Hz to Nyquist.
