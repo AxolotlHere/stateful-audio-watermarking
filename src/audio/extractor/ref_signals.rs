@@ -21,6 +21,10 @@
 use std::f32::consts::PI;
 use super::fingerprint::ChunkFingerprint;
 
+// Keep these matched exactly to the live layer implementations.
+const L10_NOISE_SHAPING_AMPLITUDE: f32 = 0.00035;
+const L12_LOGISTIC_MAP_AMPLITUDE: f32 = 0.00045;
+
 /// Expected residual correlation for the correct key, per layer.
 /// Measured empirically: correct key produces these corr values due to
 /// other layers' deltas polluting (wm - sim_before).
@@ -103,12 +107,9 @@ fn score_amplitude_scaling(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 
 // ─── L2: Micro Time Shift ─────────────────────────────────────────────────────
 fn score_micro_time_shift(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
-    let n = sb.len();
-    if n == 0 { return 0.0; }
-    let shift = (key_byte as usize % 8) + 1;
-    let mut predicted = sb.to_vec();
-    predicted.rotate_right(shift.min(n));
-    for s in predicted[..shift.min(n)].iter_mut() { *s = 0.0; }
+    let t = key_byte as f32 / 255.0;
+    let frac_delay = 0.05 + t * 0.40;
+    let predicted = apply_fractional_delay(sb, frac_delay);
     residual_corr(wm, sb, &predicted)
 }
 
@@ -149,10 +150,11 @@ fn score_narrowband_atten(wm: &[f32], sb: &[f32], sr: f32, key_byte: u8) -> f32 
 // ─── L7: Phase Perturbation (All-Pass) ───────────────────────────────────────
 fn score_phase_perturbation(wm: &[f32], sb: &[f32], sr: f32, key_byte: u8) -> f32 {
     let t   = key_byte as f32 / 255.0;
-    let fp  = 500.0 + t * 4500.0;
+    let fp  = 700.0 + t * 2900.0;
     let tan = (PI * fp / sr).tan();
     let c   = (tan - 1.0) / (tan + 1.0);
-    let predicted = apply_allpass(sb, c);
+    let wet = 0.08 + t * 0.10;
+    let predicted = apply_mixed_allpass(sb, c, wet);
     residual_corr(wm, sb, &predicted)
 }
 
@@ -196,13 +198,13 @@ fn score_energy_redistrib(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 // Simpler and correct: dot (wm - sim_before) against sequence, but
 // divide by RMS(wm - sim_before) so pollution doesn't swamp the signal.
 fn score_noise_shaping(wm: &[f32], sb: &[f32], sa: &[f32], key_u64: u64) -> f32 {
-    let amplitude = 0.00035_f32;
+    let amplitude = L10_NOISE_SHAPING_AMPLITUDE;
     let n = wm.len().min(sb.len()).min(sa.len());
     if n == 0 { return 0.0; }
 
     // Generate the expected noise sequence
     let mut state = key_u64;
-    let mut seq: Vec<f32> = (0..n).map(|_| next_xorshift(&mut state) * amplitude).collect();
+    let seq: Vec<f32> = (0..n).map(|_| next_xorshift(&mut state) * amplitude).collect();
 
     // Residual = wm - sim_before (contains this layer's noise + later-layer deltas)
     let residual: Vec<f32> = wm[..n].iter().zip(&sb[..n]).map(|(w, s)| w - s).collect();
@@ -210,7 +212,6 @@ fn score_noise_shaping(wm: &[f32], sb: &[f32], sa: &[f32], key_u64: u64) -> f32 
     // Correlate residual against expected sequence (normalised dot product)
     let dot: f64 = residual.iter().zip(&seq).map(|(r, s)| *r as f64 * *s as f64).sum();
     let seq_nrg: f64 = seq.iter().map(|s| *s as f64 * *s as f64).sum();
-    let res_nrg: f64 = residual.iter().map(|r| *r as f64 * *r as f64).sum();
 
     if seq_nrg < 1e-30 { return 0.0; }
 
@@ -221,14 +222,12 @@ fn score_noise_shaping(wm: &[f32], sb: &[f32], sa: &[f32], key_u64: u64) -> f32 
     ((dot / seq_nrg) as f32).clamp(0.0, 1.0)
 }
 
-// ─── L11: Controlled Nonlinear (tanh) ────────────────────────────────────────
+// ─── L11: Masked Micro-Gain Modulation ───────────────────────────────────────
 fn score_controlled_nonlinear(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
-    let t    = key_byte as f32 / 255.0;
-    let drive = 1.001 + t * 0.009;
-    let norm  = drive.tanh();
-    let predicted: Vec<f32> = sb.iter()
-        .map(|&x| ((drive * x).tanh() / norm).clamp(-1.0, 1.0))
-        .collect();
+    let t = key_byte as f32 / 255.0;
+    let amplitude = 0.0015 + t * 0.0020;
+    let seed = (key_byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95) | 1;
+    let predicted = apply_masked_micro_gain(sb, seed, amplitude);
     residual_corr(wm, sb, &predicted)
 }
 
@@ -236,7 +235,7 @@ fn score_controlled_nonlinear(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 fn score_logistic_map(wm: &[f32], sb: &[f32], sa: &[f32], key_byte: u8) -> f32 {
     let t         = key_byte as f64 / 255.0;
     let r         = 3.9 + t * 0.099;
-    let amplitude = 0.00045_f32;
+    let amplitude = L12_LOGISTIC_MAP_AMPLITUDE;
     let mut x     = 0.1 + t * 0.8;
     let n         = wm.len().min(sb.len()).min(sa.len());
     if n == 0 { return 0.0; }
@@ -250,7 +249,6 @@ fn score_logistic_map(wm: &[f32], sb: &[f32], sa: &[f32], key_byte: u8) -> f32 {
 
     let dot: f64    = residual.iter().zip(&seq).map(|(r, s)| *r as f64 * *s as f64).sum();
     let seq_nrg: f64 = seq.iter().map(|s| *s as f64 * *s as f64).sum();
-    let res_nrg: f64 = residual.iter().map(|r| *r as f64 * *r as f64).sum();
 
     if seq_nrg < 1e-30 { return 0.0; }
 
@@ -386,6 +384,43 @@ fn apply_allpass(x: &[f32], c: f32) -> Vec<f32> {
     out
 }
 
+fn apply_mixed_allpass(x: &[f32], c: f32, wet: f32) -> Vec<f32> {
+    let dry = 1.0 - wet;
+    let mut out = Vec::with_capacity(x.len());
+    let (mut x1, mut y1) = (0.0_f32, 0.0_f32);
+    for &xn in x {
+        let ap = c * (xn - y1) + x1;
+        x1 = xn;
+        y1 = ap;
+        out.push((dry * xn + wet * ap).clamp(-1.0, 1.0));
+    }
+    out
+}
+
+fn apply_fractional_delay(x: &[f32], frac_delay: f32) -> Vec<f32> {
+    if x.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(x.len());
+    let mut prev = x[0];
+    for &xn in x {
+        out.push(((1.0 - frac_delay) * xn + frac_delay * prev).clamp(-1.0, 1.0));
+        prev = xn;
+    }
+    out
+}
+
+fn apply_masked_micro_gain(x: &[f32], mut state: u64, amplitude: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    for &xn in x {
+        let seq = xorshift_signed(&mut state);
+        let mask = xn.abs() / (xn.abs() + 0.05);
+        let gain = 1.0 + seq * amplitude * mask;
+        out.push((xn * gain).clamp(-1.0, 1.0));
+    }
+    out
+}
+
 // ═══ Misc helpers ═════════════════════════════════════════════════════════════
 
 fn score_from_delta(delta: f32, tolerance: f32) -> f32 {
@@ -404,4 +439,8 @@ fn xorshift_f01(state: &mut u64) -> f32 {
     x ^= x << 13; x ^= x >> 7; x ^= x << 17;
     *state = x;
     (x >> 11) as f32 / (1u64 << 53) as f32
+}
+
+fn xorshift_signed(state: &mut u64) -> f32 {
+    xorshift_f01(state) * 2.0 - 1.0
 }

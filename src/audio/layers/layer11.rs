@@ -1,26 +1,25 @@
-//! Layer 11 – Controlled Nonlinear Transform (Soft Saturation)
+//! Layer 11 – Masked Micro-Gain Modulation
 //!
-//! WHAT  : Applies a hyperbolic-tangent soft clipper with a drive factor
-//!         so close to 1.0 that the nonlinear component is negligible.
-//!         Formula:  y = tanh(drive * x) / tanh(drive)
-//!         where drive ∈ [1.001, 1.010] is key-derived.
+//! WHAT  : Applies a keyed zero-mean gain perturbation whose strength is
+//!         masked by the local sample magnitude. Louder samples get slightly
+//!         stronger modulation; near-silence is barely touched.
 //!
-//! SAFE  : At drive = 1.01, the THD introduced is < 0.01 % (−80 dB),
-//!         which is far below audibility.  The output is bounded to [−1, 1].
+//! SAFE  : This avoids harmonic generation from nonlinear waveshaping and
+//!         keeps the perturbation bounded and signal-adaptive.
 
 use super::layer_trait::Layer;
 
 pub struct ControlledNonlinearLayer {
-    drive: f32,
-    normaliser: f32,
+    seed: u64,
+    amplitude: f32,
 }
 
 impl ControlledNonlinearLayer {
     pub fn new(key_byte: u8) -> Self {
         let t = key_byte as f32 / 255.0;
-        let drive = 1.001 + t * 0.009; // 1.001 – 1.010
-        let normaliser = drive.tanh();
-        Self { drive, normaliser }
+        let seed = (key_byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95) | 1;
+        let amplitude = 0.0015 + t * 0.0020;
+        Self { seed, amplitude }
     }
 }
 
@@ -30,10 +29,22 @@ impl Layer for ControlledNonlinearLayer {
     }
 
     fn apply(&self, samples: &mut [f32], _sample_rate: u32) {
+        let mut state = self.seed;
         for s in samples.iter_mut() {
-            *s = (self.drive * *s).tanh() / self.normaliser;
-            // tanh output is already in (-1,1), clamp for float safety
-            *s = s.clamp(-1.0, 1.0);
+            let seq = xorshift_signed(&mut state);
+            let mask = s.abs() / (s.abs() + 0.05);
+            let gain = 1.0 + seq * self.amplitude * mask;
+            *s = (*s * gain).clamp(-1.0, 1.0);
         }
     }
+}
+
+#[inline]
+fn xorshift_signed(state: &mut u64) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    ((x >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
 }

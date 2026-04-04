@@ -4,6 +4,7 @@ use audio::io::{plot_chunks, plot_waveform, read_wav, write_wav};
 use audio::layers::{apply_chained_layers, permute_layers, KeyedChunker};
 use audio::extractor::{extract_with_ref, Fingerprint};
 use audio::extractor::key_test::run_key_test;
+use audio::metrics::run_metrics;
 use audio::robustness::{run_robustness_test, print_robustness_report, print_layer_survival};
 use std::env;
 
@@ -16,6 +17,7 @@ fn main() {
 
     match mode {
         "verify"      => run_verify(key),
+        "metrics"     => run_metrics_mode(key, &args),
         "robustness"  => run_robustness(key),
         "security"    => run_security(key),
         _             => run_embed(key),
@@ -57,8 +59,9 @@ fn run_embed(key: u64) {
         if chunker.should_watermark_chunk(chunk_idx, total_chunks) {
             for (region_idx, (start, end)) in chunker.watermark_windows(chunk_idx, chunk.len()).into_iter().enumerate() {
                 let region_seed = keyed_region_seed(chunk_idx, region_idx);
+                let original_region = chunk[start..end].to_vec();
                 apply_chained_layers(&mut chunk[start..end], wave.sample_rate, key, &order, region_seed);
-                chunker.apply_boundary_fade(&mut chunk[start..end]);
+                chunker.blend_region_edges(&original_region, &mut chunk[start..end]);
             }
             watermarked_chunks += 1;
         }
@@ -80,6 +83,7 @@ fn run_embed(key: u64) {
     write_wav(&wave, "output_watermarked.wav");
 
     println!("\nOutput: output_watermarked.wav + original.wmpf");
+    println!("Metrics   : cargo run -- metrics 0x{:016X}", key);
     println!("Verify    : cargo run -- verify 0x{:016X}", key);
     println!("Security  : cargo run -- security 0x{:016X}", key);
     println!("Robustness: cargo run -- robustness 0x{:016X}", key);
@@ -102,6 +106,23 @@ fn run_verify(key: u64) {
             result.print_report();
         }
         Err(e) => eprintln!("Could not load original.wmpf: {e}"),
+    }
+}
+
+fn run_metrics_mode(key: u64, args: &[String]) {
+    println!("═══ METRICS MODE ═════════════════════════════════════════");
+
+    let original_wav = args.get(3).map(String::as_str).unwrap_or("input_sample/Faint-1.wav");
+    let watermarked_wav = args.get(4).map(String::as_str).unwrap_or("output_watermarked.wav");
+    let fingerprint_path = args.get(5).map(String::as_str).unwrap_or("original.wmpf");
+
+    println!(" Original    : {}", original_wav);
+    println!(" Watermarked : {}", watermarked_wav);
+    println!(" Fingerprint : {}", fingerprint_path);
+
+    match run_metrics(original_wav, watermarked_wav, fingerprint_path, key) {
+        Ok(report) => report.print_report(),
+        Err(err) => eprintln!("Metrics failed: {err}"),
     }
 }
 

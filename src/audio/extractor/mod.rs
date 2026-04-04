@@ -28,6 +28,11 @@ const MIN_ALIGNMENT_SCORE: f32 = 0.18;
 const MIN_REGION_RATIO: f32 = 0.25;
 const MIN_STRONG_LAYER_HITS: usize = 2;
 const MIN_SPREAD_HITS: usize = 1;
+const SPREAD_RESCUE_MEAN: f32 = 0.45;
+const SPREAD_RESCUE_ALIGNMENT: f32 = 0.04;
+const SPREAD_RESCUE_REGION_RATIO: f32 = 0.08;
+const SPREAD_PEAK_RESCUE: f32 = 0.28;
+const MIN_RESCUE_SUPPORT: f32 = 0.10;
 
 /// Verify a watermarked file using the original fingerprint.
 ///
@@ -73,8 +78,9 @@ pub fn extract_with_ref(
 
         let shared_len = wm_chunk.len().min(orig.orig_samples.len());
         for (region_idx, (start, end)) in chunker
-            .watermark_windows(chunk_idx, shared_len)
+            .watermark_windows(chunk_idx, orig.orig_samples.len())
             .into_iter()
+            .filter(|&(_, end)| end <= shared_len)
             .enumerate()
         {
             selected_regions += 1;
@@ -109,7 +115,7 @@ pub fn extract_with_ref(
                 state = state.advance(&sim_region, sample_rate);
             }
 
-            chunker.apply_boundary_fade(&mut sim_region);
+            chunker.blend_region_edges(orig_region, &mut sim_region);
 
             let alignment = residual_alignment(wm_region, orig_region, &sim_region);
             let region_ratio = keyed_region_ratio(
@@ -122,6 +128,7 @@ pub fn extract_with_ref(
             );
             let mean_layer_score = per_layer_scores.iter().sum::<f32>() / per_layer_scores.len() as f32;
             let spread_mean = (per_layer_scores[9] + per_layer_scores[11]) * 0.5;
+            let spread_peak = per_layer_scores[9].max(per_layer_scores[11]);
             let strong_layer_hits = per_layer_scores
                 .iter()
                 .enumerate()
@@ -142,6 +149,18 @@ pub fn extract_with_ref(
                     && region_ratio >= MIN_REGION_RATIO
                     && strong_layer_hits >= MIN_STRONG_LAYER_HITS
                     && spread_hits >= MIN_SPREAD_HITS
+                )
+                || (
+                    spread_mean >= SPREAD_RESCUE_MEAN
+                    && spread_hits >= MIN_SPREAD_HITS
+                    && strong_layer_hits >= 1
+                    && (alignment >= SPREAD_RESCUE_ALIGNMENT
+                        || region_ratio >= SPREAD_RESCUE_REGION_RATIO)
+                )
+                || (
+                    spread_peak >= SPREAD_PEAK_RESCUE
+                    && spread_hits >= MIN_SPREAD_HITS
+                    && chunk_support >= MIN_RESCUE_SUPPORT
                 );
 
             for idx in 0..15 {
@@ -224,6 +243,7 @@ fn strong_layer_threshold(layer_idx: usize) -> f32 {
     match layer_idx {
         1 | 6 | 8 | 10 => 0.45,   // strong geometric layers
         9 | 11 => 0.40,            // spread-spectrum matched filter
+        3 | 7 | 12 | 13 | 14 => 0.05, // subtle layers that never reach 0.20 raw corr
         _ => 0.20,                 // subtle filter/gain layers
     }
 }
@@ -231,7 +251,7 @@ fn strong_layer_threshold(layer_idx: usize) -> f32 {
 fn relaxed_layer_threshold(layer_idx: usize) -> f32 {
     match layer_idx {
         9 | 11 => 0.30,
-        _ => 0.10,
+        _ => 0.05,
     }
 }
 

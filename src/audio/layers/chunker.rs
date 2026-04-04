@@ -160,6 +160,26 @@ impl KeyedChunker {
             chunk[len - 1 - i] *= gain;
         }
     }
+
+    /// Blend the processed region back into the unmodified audio at the
+    /// region edges. Unlike `apply_boundary_fade`, this preserves the host
+    /// signal energy at internal watermark-window boundaries.
+    pub fn blend_region_edges(&self, original: &[f32], processed: &mut [f32]) {
+        let len = original.len().min(processed.len());
+        let fade = self.fade_samples.min(len / 2);
+        if len == 0 || fade == 0 {
+            return;
+        }
+
+        for i in 0..fade {
+            let wet = i as f32 / fade as f32;
+            let dry = 1.0 - wet;
+            processed[i] = original[i] * dry + processed[i] * wet;
+
+            let j = len - 1 - i;
+            processed[j] = original[j] * dry + processed[j] * wet;
+        }
+    }
 }
 
 // ─── Iterator helper ─────────────────────────────────────────────────────────
