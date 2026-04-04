@@ -32,7 +32,7 @@ impl KeyTestResult {
         println!("{}", "─".repeat(60));
         println!(" Separation gap       : {:.1}%  (correct − max_wrong)",
             self.separation_gap * 100.0);
-        println!(" False positive rate  : {:.1}%  (wrong keys ≥ 60% threshold)",
+        println!(" False positive rate  : {:.1}%  (wrong keys ≥ 80% threshold)",
             self.false_positive_rate * 100.0);
         println!("{}", "─".repeat(60));
 
@@ -102,7 +102,7 @@ pub fn run_key_test(
     let variance   = scores.iter().map(|s| (s - mean_wrong).powi(2)).sum::<f32>()
                      / scores.len() as f32;
     let std_wrong  = variance.sqrt();
-    let threshold  = 0.60_f32;
+    let threshold  = 0.80_f32;
     let false_positives = scores.iter().filter(|&&s| s >= threshold).count();
     let false_positive_rate = false_positives as f32 / scores.len() as f32;
     let separation_gap = correct_score - max_wrong;

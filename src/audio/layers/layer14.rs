@@ -22,7 +22,7 @@ impl SpectralTiltLayer {
     pub fn new(key_byte: u8, sample_rate: u32) -> Self {
         let t = key_byte as f32 / 255.0;
         let fc = 80.0 + t * 720.0; // 80–800 Hz
-        let db_gain = if key_byte & 1 == 0 { 0.05_f32 } else { -0.05_f32 };
+        let db_gain = if key_byte & 1 == 0 { 0.12_f32 } else { -0.12_f32 };
         let sr = sample_rate as f32;
 
         // 1st-order low-shelf (bilinear)

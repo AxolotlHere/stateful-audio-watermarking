@@ -25,7 +25,7 @@ impl LogisticMapLayer {
         Self {
             r,
             x0,
-            amplitude: 0.0002,
+            amplitude: 0.00045,
         }
     }
 }

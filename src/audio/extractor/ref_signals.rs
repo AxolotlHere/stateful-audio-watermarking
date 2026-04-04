@@ -26,24 +26,6 @@ use super::fingerprint::ChunkFingerprint;
 /// other layers' deltas polluting (wm - sim_before).
 /// Calibration divides raw corr by expected, normalising correct key → 1.0.
 /// Wrong key corr ≈ 0 (orthogonal) → score ≈ 0 regardless of expected.
-const EXPECTED_CORR: [f32; 15] = [
-    0.244,  // L1  AmplitudeScaling
-    0.883,  // L2  MicroTimeShift
-    0.160,  // L3  EnvelopeShaping
-    0.222,  // L4  BandLimitedGain
-    0.050,  // L5  HFEmphasis (genuinely weak — low weight in confidence)
-    0.582,  // L6  NarrowbandAtten
-    0.909,  // L7  PhasePerturbation
-    0.075,  // L8  SampleReordering
-    0.852,  // L9  EnergyRedistrib
-    0.202,  // L10 NoiseShaping
-    0.999,  // L11 ControlledNonlinear
-    0.218,  // L12 LogisticMap
-    0.053,  // L13 CombFilter
-    0.499,  // L14 SpectralTilt
-    0.050,  // L15 TemporalVariance (floored — low weight in confidence)
-];
-
 pub fn measure_layer_ref(
     wm_chunk:    &[f32],
     _orig:       &ChunkFingerprint,
@@ -54,8 +36,13 @@ pub fn measure_layer_ref(
     key_byte:    u8,
     key_u64:     u64,
 ) -> f32 {
+    // Each scorer returns a value in [0, 1] using audio-content-independent math:
+    //   residual_corr  → corr(wm-sb, predicted-sb).max(0)   — purely geometric
+    //   L9             → delta magnitude check               — key-derived constant
+    //   L10/L12        → matched filter dot/seq_nrg          — sequence energy normalised
+    // No hardcoded per-song calibration. Works on any audio content.
     let sr = sample_rate as f32;
-    let raw = match layer_idx {
+    match layer_idx {
         0  => score_amplitude_scaling(wm_chunk, sim_before, key_byte),
         1  => score_micro_time_shift(wm_chunk, sim_before, key_byte),
         2  => score_envelope_shaping(wm_chunk, sim_before, sr, key_byte),
@@ -71,13 +58,8 @@ pub fn measure_layer_ref(
         12 => score_comb_filter(wm_chunk, sim_before, sr, key_byte),
         13 => score_spectral_tilt(wm_chunk, sim_before, sr, key_byte),
         14 => score_temporal_variance(wm_chunk, sim_before, key_byte),
-        _  => return 0.0,
-    };
-    // Calibrate: divide raw corr by expected correct-key corr.
-    // Correct key → raw ≈ EXPECTED_CORR[idx] → calibrated ≈ 1.0
-    // Wrong key   → raw ≈ 0                  → calibrated ≈ 0.0
-    let expected = EXPECTED_CORR[layer_idx];
-    (raw / expected).clamp(0.0, 1.0)
+        _  => 0.0,
+    }
 }
 
 // ─── helpers: residual-based correlation ─────────────────────────────────────
@@ -199,7 +181,7 @@ fn score_energy_redistrib(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 }
 
 // ─── L10: Noise Shaping (Xorshift spread-spectrum) ───────────────────────────
-// Layer adds: noise[i] = xorshift(key_u64) * 0.0001  ON TOP of sim_before.
+// Layer adds: noise[i] = xorshift(key_u64) * 0.00035 ON TOP of sim_before.
 // sim_after = sim_before + noise_sequence (by definition of the layer).
 // So: wm[i] - sim_after[i] ≈ 0 for correct key (all other layers cancel).
 // But we want to CONFIRM the noise is there, not that it's zero.
@@ -214,7 +196,7 @@ fn score_energy_redistrib(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 // Simpler and correct: dot (wm - sim_before) against sequence, but
 // divide by RMS(wm - sim_before) so pollution doesn't swamp the signal.
 fn score_noise_shaping(wm: &[f32], sb: &[f32], sa: &[f32], key_u64: u64) -> f32 {
-    let amplitude = 0.0001_f32;
+    let amplitude = 0.00035_f32;
     let n = wm.len().min(sb.len()).min(sa.len());
     if n == 0 { return 0.0; }
 
@@ -254,7 +236,7 @@ fn score_controlled_nonlinear(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 fn score_logistic_map(wm: &[f32], sb: &[f32], sa: &[f32], key_byte: u8) -> f32 {
     let t         = key_byte as f64 / 255.0;
     let r         = 3.9 + t * 0.099;
-    let amplitude = 0.0002_f32;
+    let amplitude = 0.00045_f32;
     let mut x     = 0.1 + t * 0.8;
     let n         = wm.len().min(sb.len()).min(sa.len());
     if n == 0 { return 0.0; }
@@ -318,7 +300,7 @@ fn score_temporal_variance(wm: &[f32], sb: &[f32], key_byte: u8) -> f32 {
 fn peaking_eq_coeffs(key_byte: u8, sr: f32) -> (f32, f32, f32, f32, f32) {
     let t       = key_byte as f32 / 255.0;
     let fc      = 200.0 + t * 3800.0;
-    let db_gain = if key_byte & 1 == 0 { 0.1_f32 } else { -0.1_f32 };
+    let db_gain = if key_byte & 1 == 0 { 0.25_f32 } else { -0.25_f32 };
     let a_coef  = 10.0_f32.powf(db_gain / 40.0);
     let w0      = 2.0 * PI * fc / sr;
     let cos_w0  = w0.cos();
@@ -362,7 +344,7 @@ fn hf_shelf_coeffs(key_byte: u8, sr: f32) -> (f32, f32, f32) {
 fn low_shelf_coeffs(key_byte: u8, sr: f32) -> (f32, f32, f32) {
     let t       = key_byte as f32 / 255.0;
     let fc      = 80.0 + t * 720.0;
-    let db_gain = if key_byte & 1 == 0 { 0.05_f32 } else { -0.05_f32 };
+    let db_gain = if key_byte & 1 == 0 { 0.12_f32 } else { -0.12_f32 };
     let k       = (PI * fc / sr).tan();
     let v       = 10.0_f32.powf(db_gain / 20.0);
     let norm    = 1.0 / (1.0 + k);

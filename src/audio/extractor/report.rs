@@ -22,7 +22,7 @@ pub struct ExtractionResult {
     pub chunk_count: usize,
     /// Sample rate of the audio.
     pub sample_rate: u32,
-    /// True if overall confidence ≥ 0.60.
+    /// True if overall confidence ≥ 0.80.
     pub watermark_detected: bool,
     /// Weighted confidence in [0.0, 1.0].
     pub confidence: f32,
@@ -74,7 +74,7 @@ impl ExtractionResult {
             println!(" VERDICT: ✓  WATERMARK CONFIRMED");
         } else {
             println!(" VERDICT: ✗  WATERMARK NOT DETECTED");
-            println!(" (confidence {:.1}% < 60% threshold)", self.confidence * 100.0);
+            println!(" (confidence {:.1}% < 80% threshold)", self.confidence * 100.0);
         }
         println!("{}", "═".repeat(60));
     }

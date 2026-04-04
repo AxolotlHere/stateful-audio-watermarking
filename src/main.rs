@@ -35,23 +35,40 @@ fn run_embed(key: u64) {
     println!("Chunk size : {} samples ({} s)",
         chunker.chunk_size_samples(),
         chunker.chunk_size_samples() / wave.sample_rate as usize);
+    println!("Chunk offset: {} samples", chunker.chunk_offset_samples());
 
     // ── Capture fingerprint BEFORE watermarking ───────────────────────────
     print!("Capturing original fingerprint... ");
     let fp = Fingerprint::capture(
-        &wave.samples, wave.sample_rate, key, chunker.chunk_size_samples());
+        &wave.samples,
+        wave.sample_rate,
+        key,
+        chunker.chunk_size_samples(),
+        chunker.chunk_offset_samples(),
+    );
     fp.save("original.wmpf").expect("Failed to save fingerprint");
     println!("saved {} chunks → original.wmpf", fp.chunks.len());
 
     // ── Apply chained watermark ───────────────────────────────────────────
+    let total_chunks = chunker.chunk_count(wave.samples.len());
     let mut chunk_count = 0usize;
+    let mut watermarked_chunks = 0usize;
     for (chunk_idx, chunk) in chunker.iter_chunks_mut(&mut wave.samples).enumerate() {
-        // Each chunk gets a unique chain seeded from key + chunk_idx
-        apply_chained_layers(chunk, wave.sample_rate, key, &order, chunk_idx);
-        chunker.apply_boundary_fade(chunk);
+        if chunker.should_watermark_chunk(chunk_idx, total_chunks) {
+            for (region_idx, (start, end)) in chunker.watermark_windows(chunk_idx, chunk.len()).into_iter().enumerate() {
+                let region_seed = keyed_region_seed(chunk_idx, region_idx);
+                apply_chained_layers(&mut chunk[start..end], wave.sample_rate, key, &order, region_seed);
+                chunker.apply_boundary_fade(&mut chunk[start..end]);
+            }
+            watermarked_chunks += 1;
+        }
         chunk_count += 1;
     }
-    println!("Watermarked {} chunks (chained pipeline).", chunk_count);
+    println!(
+        "Watermarked {}/{} chunks (sparse keyed pipeline).",
+        watermarked_chunks,
+        chunk_count
+    );
 
     let peak = wave.samples.iter().cloned().fold(0.0_f32, |a, s| a.max(s.abs()));
     println!("Peak: {:.6} ({})",
@@ -111,4 +128,10 @@ fn run_robustness(key: u64) {
     let baseline = results.first().and_then(|r| r.confidence()).unwrap_or(0.0);
     print_robustness_report(&results, baseline);
     print_layer_survival(&results);
+}
+
+fn keyed_region_seed(chunk_idx: usize, region_idx: usize) -> usize {
+    chunk_idx
+        .wrapping_mul(8)
+        .wrapping_add(region_idx)
 }

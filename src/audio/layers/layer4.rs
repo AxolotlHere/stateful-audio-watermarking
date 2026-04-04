@@ -24,8 +24,9 @@ impl BandLimitedGainLayer {
         let t = key_byte as f32 / 255.0;
         // Centre frequency: 200 Hz – 4 kHz
         let fc = 200.0 + t * 3800.0;
-        // dB gain: alternates sign based on key parity → ±0.1 dB
-        let db_gain = if key_byte & 1 == 0 { 0.1_f32 } else { -0.1_f32 };
+        // Directional keyed tilt is intentionally stronger so the verifier can
+        // reject wrong-key band selections by sign, not only magnitude.
+        let db_gain = if key_byte & 1 == 0 { 0.25_f32 } else { -0.25_f32 };
         let q = 1.0_f32;
         let sr = sample_rate as f32;
 

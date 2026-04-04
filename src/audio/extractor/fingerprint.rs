@@ -27,9 +27,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::f32::consts::PI;
 
 const MAGIC: &[u8; 8] = b"WMPF\x00\x01\x00\x00";
-const N_BANDS: usize = 8;
-const N_AC_LAGS: usize = 16;
-const N_ENERGY_LAGS: usize = 32;
+pub const N_BANDS: usize = 4;
+pub const N_AC_LAGS: usize = 6;
+pub const N_ENERGY_LAGS: usize = 6;
 
 /// Per-chunk statistics captured from the original audio.
 #[derive(Debug, Clone)]
@@ -54,26 +54,39 @@ pub struct Fingerprint {
     pub key: u64,
     pub sample_rate: u32,
     pub chunk_samples: u32,
+    pub chunk_offset: u32,
     pub chunks: Vec<ChunkFingerprint>,
 }
 
 impl Fingerprint {
     /// Capture fingerprint from original (un-watermarked) samples.
-    pub fn capture(samples: &[f32], sample_rate: u32, key: u64, chunk_samples: usize) -> Self {
+    pub fn capture(
+        samples: &[f32],
+        sample_rate: u32,
+        key: u64,
+        chunk_samples: usize,
+        chunk_offset: usize,
+    ) -> Self {
         let sr = sample_rate as f32;
         let band_edges = band_edges(sr);
 
         let mut chunks = Vec::new();
-        let mut offset = 0;
+        let mut offset = chunk_offset.min(samples.len());
         loop {
             if offset >= samples.len() { break; }
             let end = (offset + chunk_samples).min(samples.len());
             let chunk = &samples[offset..end];
             offset = end;
-            chunks.push(compute_chunk_fp(chunk, sr, &band_edges));
+            chunks.push(compute_chunk_fp(chunk, sr, &band_edges, true));
         }
 
-        Self { key, sample_rate, chunk_samples: chunk_samples as u32, chunks }
+        Self {
+            key,
+            sample_rate,
+            chunk_samples: chunk_samples as u32,
+            chunk_offset: chunk_offset as u32,
+            chunks,
+        }
     }
 
     /// Save to a `.wmpf` file.
@@ -86,6 +99,7 @@ impl Fingerprint {
         w.write_all(&self.sample_rate.to_le_bytes())?;
         w.write_all(&(self.chunks.len() as u32).to_le_bytes())?;
         w.write_all(&self.chunk_samples.to_le_bytes())?;
+        w.write_all(&self.chunk_offset.to_le_bytes())?;
 
         for c in &self.chunks {
             w.write_all(&c.rms.to_le_bytes())?;
@@ -116,6 +130,7 @@ impl Fingerprint {
         let sample_rate  = read_u32(&mut r)?;
         let n_chunks     = read_u32(&mut r)? as usize;
         let chunk_samples = read_u32(&mut r)?;
+        let chunk_offset = read_u32(&mut r)?;
 
         let mut chunks = Vec::with_capacity(n_chunks);
         for _ in 0..n_chunks {
@@ -133,13 +148,24 @@ impl Fingerprint {
             chunks.push(ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac, orig_samples });
         }
 
-        Ok(Self { key, sample_rate, chunk_samples, chunks })
+        Ok(Self { key, sample_rate, chunk_samples, chunk_offset, chunks })
     }
 }
 
 // ─── Computation ─────────────────────────────────────────────────────────────
 
-fn compute_chunk_fp(chunk: &[f32], sr: f32, band_edges: &[f32]) -> ChunkFingerprint {
+pub fn analyze_chunk(chunk: &[f32], sample_rate: u32) -> ChunkFingerprint {
+    let sr = sample_rate as f32;
+    let band_edges = band_edges(sr);
+    compute_chunk_fp(chunk, sr, &band_edges, false)
+}
+
+fn compute_chunk_fp(
+    chunk: &[f32],
+    sr: f32,
+    band_edges: &[f32],
+    include_orig_samples: bool,
+) -> ChunkFingerprint {
     let rms = compute_rms(chunk);
     let dc  = chunk.iter().sum::<f32>() / chunk.len().max(1) as f32;
 
@@ -164,7 +190,14 @@ fn compute_chunk_fp(chunk: &[f32], sr: f32, band_edges: &[f32]) -> ChunkFingerpr
         *v = if eac0 > 1e-12 { autocorr_raw(&energy, i + 1) / eac0 } else { 0.0 };
     }
 
-    ChunkFingerprint { rms, dc, band_rms, ac_lags, energy_ac, orig_samples: chunk.to_vec() }
+    ChunkFingerprint {
+        rms,
+        dc,
+        band_rms,
+        ac_lags,
+        energy_ac,
+        orig_samples: if include_orig_samples { chunk.to_vec() } else { Vec::new() },
+    }
 }
 
 /// 8 log-spaced band edges from 20 Hz to Nyquist.

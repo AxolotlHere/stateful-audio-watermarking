@@ -102,7 +102,7 @@ fn measure_envelope_shaping(chunk: &[f32], sample_rate: u32, key_byte: u8) -> f3
 fn measure_band_limited_gain(chunk: &[f32], sample_rate: u32, key_byte: u8) -> f32 {
     let t = key_byte as f32 / 255.0;
     let fc = 200.0 + t * 3800.0;
-    let db_gain = if key_byte & 1 == 0 { 0.1_f32 } else { -0.1_f32 };
+    let db_gain = if key_byte & 1 == 0 { 0.25_f32 } else { -0.25_f32 };
     let sr = sample_rate as f32;
 
     // Band energy ratio: energy in [fc-100, fc+100] vs [fc-300, fc-100]
@@ -198,7 +198,7 @@ fn measure_energy_redistribution(chunk: &[f32], key_byte: u8) -> f32 {
 // Re-generate the exact pseudo-random sequence from the key and correlate
 // against the chunk. This is the most powerful extractor.
 fn measure_noise_shaping(chunk: &[f32], key: u64) -> f32 {
-    let amplitude = 0.0001_f32;
+    let amplitude = 0.00035_f32;
     let mut state = key;
     let sequence: Vec<f32> = chunk.iter().map(|_| {
         next_xorshift(&mut state) * amplitude
@@ -230,7 +230,7 @@ fn measure_controlled_nonlinear(chunk: &[f32], key_byte: u8) -> f32 {
 fn measure_logistic_map(chunk: &[f32], key_byte: u8) -> f32 {
     let t = key_byte as f64 / 255.0;
     let r  = 3.9 + t * 0.099;
-    let amplitude = 0.0002_f32;
+    let amplitude = 0.00045_f32;
     let mut x = 0.1 + t * 0.8;
 
     let sequence: Vec<f32> = chunk.iter().map(|_| {
@@ -264,7 +264,7 @@ fn measure_comb_filter(chunk: &[f32], sample_rate: u32, key_byte: u8) -> f32 {
 fn measure_spectral_tilt(chunk: &[f32], sample_rate: u32, key_byte: u8) -> f32 {
     let t = key_byte as f32 / 255.0;
     let fc = 80.0 + t * 720.0;
-    let db_gain = if key_byte & 1 == 0 { 0.05_f32 } else { -0.05_f32 };
+    let db_gain = if key_byte & 1 == 0 { 0.12_f32 } else { -0.12_f32 };
     let sr = sample_rate as f32;
 
     let low_energy  = band_rms(chunk, sr, 20.0, fc);

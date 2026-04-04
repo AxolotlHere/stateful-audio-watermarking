@@ -18,7 +18,7 @@ impl NoiseShapingLayer {
     pub fn new(key: u64) -> Self {
         Self {
             seed: key,
-            amplitude: 0.0001, // −80 dBFS
+            amplitude: 0.00035,
         }
     }
 

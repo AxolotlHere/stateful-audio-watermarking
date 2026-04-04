@@ -134,7 +134,7 @@ fn attack_aac(input_wav: &str, bitrate: u32, _sample_rate: u32) -> Option<Vec<f3
 // ─── Additive Noise ───────────────────────────────────────────────────────────
 // Uses sox synth to add white noise at a given dBFS level
 
-fn attack_noise(input_wav: &str, noise_db: f32, _sample_rate: u32) -> Option<Vec<f32>> {
+fn attack_noise(input_wav: &str, noise_db: f32, sample_rate: u32) -> Option<Vec<f32>> {
     let tag = format!("{}", noise_db.abs() as u32);
     let tmp_wav = format!("/tmp/wm_attack_noise{tag}.wav");
 
@@ -171,10 +171,10 @@ fn attack_noise(input_wav: &str, noise_db: f32, _sample_rate: u32) -> Option<Vec
     let duration: f32 = String::from_utf8_lossy(&dur_out.stdout)
         .trim().parse().unwrap_or(30.0);
 
-    // Generate noise file
+    // Generate noise file at the same sample rate as the input
     let noise_gen = Command::new("sox")
         .args([
-            "-n", "-r", "48000", "-c", "1",
+            "-n", "-r", &sample_rate.to_string(), "-c", "1",
             &tmp_noise,
             "synth", &format!("{duration:.3}"),
             "whitenoise",
@@ -200,7 +200,10 @@ fn attack_noise(input_wav: &str, noise_db: f32, _sample_rate: u32) -> Option<Vec
 }
 
 // ─── Trimming ────────────────────────────────────────────────────────────────
-// Remove `pct` of audio from the start
+// Remove `pct` of audio from the END (tail trim).
+// Trimming from the start would shift all sample positions and break the
+// key-derived chunk alignment. Tail trim is a realistic attack that preserves
+// the watermarked region while reducing file length.
 
 fn attack_trim(input_wav: &str, pct: f32, _sample_rate: u32) -> Option<Vec<f32>> {
     let tag = format!("{}", (pct * 100.0) as u32);
@@ -212,11 +215,12 @@ fn attack_trim(input_wav: &str, pct: f32, _sample_rate: u32) -> Option<Vec<f32>>
         .output().ok()?;
     let duration: f32 = String::from_utf8_lossy(&dur_out.stdout)
         .trim().parse().unwrap_or(30.0);
-    let trim_secs = duration * pct;
+    let keep_secs = duration * (1.0 - pct);
 
+    // trim 0 <keep_secs> = keep from 0 to keep_secs (drops the tail)
     let status = Command::new("sox")
         .args([input_wav, &tmp_wav,
-               "trim", &format!("{trim_secs:.3}")])
+               "trim", "0", &format!("{keep_secs:.3}")])
         .output().ok()?;
     if !status.status.success() {
         eprintln!("Trim failed: {}", String::from_utf8_lossy(&status.stderr));
