@@ -27,7 +27,7 @@ fn main() {
 fn run_embed(key: u64) {
     println!("═══ EMBED MODE ═══════════════════════════════════════════");
 
-    let mut wave = read_wav("input_sample/Faint-1.wav");
+    let mut wave = read_wav("input_sample/sample-2.wav");
     println!("Loaded {} samples @ {} Hz", wave.samples.len(), wave.sample_rate);
 
     let order   = permute_layers(key);
@@ -112,7 +112,8 @@ fn run_verify(key: u64) {
 fn run_metrics_mode(key: u64, args: &[String]) {
     println!("═══ METRICS MODE ═════════════════════════════════════════");
 
-    let original_wav = args.get(3).map(String::as_str).unwrap_or("input_sample/Faint-1.wav");
+    let original_wav = args.get(3).map(String::as_str).unwrap_or("input_sample/sample-2.wav");
+    
     let watermarked_wav = args.get(4).map(String::as_str).unwrap_or("output_watermarked.wav");
     let fingerprint_path = args.get(5).map(String::as_str).unwrap_or("original.wmpf");
 
